@@ -314,7 +314,7 @@ async def on_ready():
     # Schedule daily reminder at 9:00 AM ET
     scheduler.add_job(
         send_daily_reminder,
-        CronTrigger(hour=9, minute=0, timezone=ET),
+        CronTrigger(hour=8, minute=0, timezone=ET),
         id="daily_reminder",
         replace_existing=True,
     )
