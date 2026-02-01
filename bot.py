@@ -1,13 +1,20 @@
 import os
 import random
+import re
 from datetime import datetime
 
+import aiohttp
 import anthropic
 import discord
 import pytz
+from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
+
+# URL regex pattern
+URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+
 
 load_dotenv()
 
@@ -60,6 +67,77 @@ async def generate_business_quote() -> str:
     except Exception as e:
         print(f"Error generating quote: {e}")
         return random.choice(FALLBACK_QUOTES)
+
+
+async def fetch_article_content(url: str) -> str | None:
+    """Fetch and extract text content from a URL."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status != 200:
+                    return None
+                html = await response.text()
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove script and style elements
+        for element in soup(["script", "style", "nav", "header", "footer", "aside"]):
+            element.decompose()
+
+        # Try to find the main article content
+        article = soup.find("article") or soup.find("main") or soup.find("body")
+        if not article:
+            return None
+
+        # Get text and clean it up
+        text = article.get_text(separator="\n", strip=True)
+
+        # Limit to first ~8000 chars to avoid token limits
+        if len(text) > 8000:
+            text = text[:8000] + "..."
+
+        return text
+    except Exception as e:
+        print(f"Error fetching article: {e}")
+        return None
+
+
+async def summarize_article(url: str) -> str:
+    """Fetch an article and summarize it using Claude."""
+    if not claude_client:
+        return "Sorry, I can't summarize articles without an Anthropic API key configured."
+
+    content = await fetch_article_content(url)
+    if not content:
+        return f"Sorry, I couldn't fetch the content from that URL. It might be paywalled, require login, or block bots."
+
+    try:
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"""Please summarize this article concisely. Include:
+- The main topic/thesis
+- Key points (3-5 bullet points)
+- Any important conclusions or takeaways
+
+Article content:
+{content}"""
+            }],
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"Error summarizing article: {e}")
+        return "Sorry, I encountered an error trying to summarize the article."
+
+
+def extract_urls(text: str) -> list[str]:
+    """Extract URLs from text."""
+    return URL_PATTERN.findall(text)
 
 
 async def get_countdown_message() -> str:
@@ -117,7 +195,54 @@ async def on_message(message):
         await message.channel.send("Sorry, I'm not configured to chat yet. Please add an Anthropic API key.")
         return
 
-    # Show typing indicator while processing
+    # Get the user's message (remove the bot mention)
+    user_message = message.content.replace(f"<@{client.user.id}>", "").strip().lower()
+
+    # Check if user wants to summarize an article
+    summarize_keywords = ["summarize", "summary", "tldr", "tl;dr", "sum up", "what does this say", "what's this about"]
+    wants_summary = any(keyword in user_message for keyword in summarize_keywords)
+
+    if wants_summary:
+        # Show typing indicator while processing
+        async with message.channel.typing():
+            # First check for URLs in the current message
+            urls = extract_urls(message.content)
+
+            # If no URLs in current message, check if replying to a message with URLs
+            if not urls and message.reference:
+                try:
+                    replied_msg = await message.channel.fetch_message(message.reference.message_id)
+                    urls = extract_urls(replied_msg.content)
+                except:
+                    pass
+
+            # If still no URLs, check recent messages for URLs
+            if not urls:
+                async for msg in message.channel.history(limit=10):
+                    if msg.id != message.id:
+                        found_urls = extract_urls(msg.content)
+                        if found_urls:
+                            urls = found_urls
+                            break
+
+            if not urls:
+                await message.reply("I couldn't find any URLs to summarize. Share a link or reply to a message with a link!")
+                return
+
+            # Summarize the first URL found
+            url = urls[0]
+            await message.reply(f"Let me read that article for you...")
+            summary = await summarize_article(url)
+
+            # Send the summary (split if too long for Discord)
+            if len(summary) <= 2000:
+                await message.channel.send(summary)
+            else:
+                for i in range(0, len(summary), 2000):
+                    await message.channel.send(summary[i : i + 2000])
+        return
+
+    # Regular chat response
     async with message.channel.typing():
         # Fetch recent messages for context (last 25 messages)
         history = []
@@ -142,7 +267,9 @@ async def on_message(message):
 Keep your responses concise and friendly - this is a chat, not an essay.
 If someone asks about deadlines, the team has two coming up:
 - Metabit Contract: March 10th, 2026
-- Pear Demo Day: April 2nd, 2026"""
+- Pear Demo Day: April 2nd, 2026
+
+You can also summarize articles if someone shares a URL and asks you to summarize it."""
 
         user_prompt = f"""Here's the recent conversation in this channel:
 
