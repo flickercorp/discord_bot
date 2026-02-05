@@ -179,6 +179,44 @@ async def send_daily_reminder():
     print(f"Sent daily reminder at {datetime.now(ET)}")
 
 
+async def check_and_send_missed_reminder():
+    """Check if today's reminder was missed and send it if needed."""
+    if not CHANNEL_ID:
+        return
+
+    now = datetime.now(ET)
+    today = now.date()
+    reminder_hour = 8  # 8:00 AM ET
+
+    # Only check if it's past the reminder time
+    if now.hour < reminder_hour:
+        print(f"It's before {reminder_hour}:00 AM ET, no need to check for missed reminder")
+        return
+
+    channel = client.get_channel(int(CHANNEL_ID))
+    if channel is None:
+        print(f"Error: Could not find channel with ID {CHANNEL_ID}")
+        return
+
+    # Check recent messages to see if we already sent today's reminder
+    try:
+        async for msg in channel.history(limit=50):
+            # Only check messages from our bot
+            if msg.author == client.user:
+                # Check if message was sent today and contains the reminder format
+                msg_date = msg.created_at.astimezone(ET).date()
+                if msg_date == today and "Hey Gents, here's the deadline:" in msg.content:
+                    print(f"Today's reminder was already sent at {msg.created_at}")
+                    return
+
+        # If we get here, no reminder was sent today - send it now
+        print(f"Missed reminder detected! Sending now at {now}")
+        await send_daily_reminder()
+
+    except Exception as e:
+        print(f"Error checking for missed reminder: {e}")
+
+
 @client.event
 async def on_message(message):
     """Handle incoming messages - respond when bot is mentioned."""
@@ -320,6 +358,9 @@ async def on_ready():
     )
     scheduler.start()
     print("Scheduler started - daily reminders at 8:00 AM ET")
+
+    # Check if we missed today's reminder (e.g., due to restart)
+    await check_and_send_missed_reminder()
 
 
 if __name__ == "__main__":
