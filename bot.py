@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import re
@@ -21,6 +22,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")
 
 # Initialize Anthropic client
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -138,6 +140,226 @@ Article content:
 def extract_urls(text: str) -> list[str]:
     """Extract URLs from text."""
     return URL_PATTERN.findall(text)
+
+
+# Attio API base URL
+ATTIO_API_BASE = "https://api.attio.com/v2"
+
+# Attio tools definition for Claude
+ATTIO_TOOLS = [
+    {
+        "name": "list_deals",
+        "description": "List deals from the Attio CRM sales pipeline. Can filter by stage. Returns deal names, values, stages, sources, and other key information.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stage": {
+                    "type": "string",
+                    "description": "Filter by pipeline stage. Valid stages: Lead, Qualified, Demo, Contract Out, Won, Lost, Revisit"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of deals to return (default 20, max 100)",
+                    "default": 20
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_deal",
+        "description": "Get detailed information about a specific deal by its ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {
+                    "type": "string",
+                    "description": "The unique ID of the deal to retrieve"
+                }
+            },
+            "required": ["deal_id"]
+        }
+    },
+    {
+        "name": "search_deals",
+        "description": "Search for deals in Attio CRM by company/deal name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The company or deal name to search for"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "list_pipeline_stages",
+        "description": "List all available pipeline stages/statuses to understand the sales process.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_pipeline_summary",
+        "description": "Get a summary of the entire pipeline showing deal counts and total values by stage.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+]
+
+
+async def attio_request(endpoint: str, method: str = "GET", json_data: dict = None) -> dict | None:
+    """Make an authenticated request to the Attio API."""
+    if not ATTIO_API_KEY:
+        return {"error": "Attio API key not configured"}
+
+    headers = {
+        "Authorization": f"Bearer {ATTIO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{ATTIO_API_BASE}{endpoint}"
+            async with session.request(
+                method,
+                url,
+                headers=headers,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_text = await response.text()
+                    print(f"Attio API error {response.status}: {error_text}")
+                    return {"error": f"API returned status {response.status}"}
+    except Exception as e:
+        print(f"Attio request error: {e}")
+        return {"error": str(e)}
+
+
+async def attio_list_deals(limit: int = 20, stage: str = None) -> dict:
+    """List deals from Attio CRM, optionally filtered by stage."""
+    query_data = {"limit": min(limit, 100)}
+
+    if stage:
+        query_data["filter"] = {"stage": stage}
+
+    result = await attio_request(
+        "/objects/deals/records/query",
+        method="POST",
+        json_data=query_data
+    )
+    return result or {"error": "Failed to fetch deals"}
+
+
+async def attio_get_deal(deal_id: str) -> dict:
+    """Get a specific deal by ID using query filter."""
+    result = await attio_request(
+        "/objects/deals/records/query",
+        method="POST",
+        json_data={
+            "filter": {"record_id": deal_id}
+        }
+    )
+    return result or {"error": "Failed to fetch deal"}
+
+
+async def attio_search_deals(query: str) -> dict:
+    """Search for deals by name."""
+    result = await attio_request(
+        "/objects/deals/records/query",
+        method="POST",
+        json_data={
+            "filter": {"name": {"$contains": query}}
+        }
+    )
+    return result or {"error": "Search failed"}
+
+
+async def attio_list_pipeline_stages() -> dict:
+    """Get unique pipeline stages from all deals."""
+    result = await attio_request(
+        "/objects/deals/records/query",
+        method="POST",
+        json_data={"limit": 100}
+    )
+    if not result or "data" not in result:
+        return {"error": "Failed to fetch pipeline info"}
+
+    # Extract unique stages
+    stages = {}
+    for deal in result.get("data", []):
+        stage_data = deal.get("values", {}).get("stage", [])
+        if stage_data and len(stage_data) > 0:
+            status = stage_data[0].get("status", {})
+            stage_id = status.get("id", {}).get("status_id")
+            stage_title = status.get("title")
+            if stage_id and stage_title and stage_id not in stages:
+                stages[stage_id] = stage_title
+
+    return {"stages": list(stages.values())}
+
+
+async def attio_get_pipeline_summary() -> dict:
+    """Get a summary of the pipeline with counts and values by stage."""
+    result = await attio_request(
+        "/objects/deals/records/query",
+        method="POST",
+        json_data={"limit": 100}
+    )
+    if not result or "data" not in result:
+        return {"error": "Failed to fetch pipeline data"}
+
+    # Aggregate by stage
+    summary = {}
+    for deal in result.get("data", []):
+        stage_data = deal.get("values", {}).get("stage", [])
+        stage_title = "Unknown"
+        if stage_data and len(stage_data) > 0:
+            stage_title = stage_data[0].get("status", {}).get("title", "Unknown")
+
+        value_data = deal.get("values", {}).get("value", [])
+        deal_value = value_data[0].get("currency_value", 0) if value_data else 0
+
+        if stage_title not in summary:
+            summary[stage_title] = {"count": 0, "total_value": 0, "deals": []}
+
+        deal_name = deal.get("values", {}).get("name", [{}])[0].get("value", "Unknown")
+        summary[stage_title]["count"] += 1
+        summary[stage_title]["total_value"] += deal_value
+        summary[stage_title]["deals"].append({"name": deal_name, "value": deal_value})
+
+    return {"pipeline_summary": summary}
+
+
+async def execute_attio_tool(tool_name: str, tool_input: dict) -> str:
+    """Execute an Attio tool and return the result as a string."""
+    if tool_name == "list_deals":
+        result = await attio_list_deals(
+            limit=tool_input.get("limit", 20),
+            stage=tool_input.get("stage")
+        )
+    elif tool_name == "get_deal":
+        result = await attio_get_deal(tool_input["deal_id"])
+    elif tool_name == "search_deals":
+        result = await attio_search_deals(tool_input["query"])
+    elif tool_name == "list_pipeline_stages":
+        result = await attio_list_pipeline_stages()
+    elif tool_name == "get_pipeline_summary":
+        result = await attio_get_pipeline_summary()
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+
+    return json.dumps(result, indent=2, default=str)
 
 
 async def get_countdown_message() -> str:
@@ -307,7 +529,9 @@ If someone asks about deadlines, the team has two coming up:
 - Metabit Contract: March 10th, 2026
 - Pear Demo Day: April 2nd, 2026
 
-You can also summarize articles if someone shares a URL and asks you to summarize it."""
+You can also summarize articles if someone shares a URL and asks you to summarize it.
+
+You have access to Attio CRM tools to look up deals, search for companies/contacts, and check the sales pipeline. Use these tools when users ask about deals, pipeline, CRM data, sales, prospects, or specific companies/contacts."""
 
         user_prompt = f"""Here's the recent conversation in this channel:
 
@@ -318,14 +542,56 @@ The user is asking you: {user_question}
 Please respond helpfully and concisely."""
 
         try:
-            # Call Claude API
+            # Determine if we should include Attio tools
+            tools = ATTIO_TOOLS if ATTIO_API_KEY else None
+
+            # Call Claude API with tools if available
             response = claude_client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
+                tools=tools,
             )
-            reply = response.content[0].text
+
+            # Handle tool use responses
+            messages = [{"role": "user", "content": user_prompt}]
+            while response.stop_reason == "tool_use":
+                # Extract tool calls from response
+                tool_results = []
+                assistant_content = response.content
+
+                for block in response.content:
+                    if block.type == "tool_use":
+                        print(f"Executing Attio tool: {block.name}")
+                        result = await execute_attio_tool(block.name, block.input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+
+                # Add assistant response and tool results to messages
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": tool_results})
+
+                # Get next response from Claude
+                response = claude_client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                )
+
+            # Extract text response
+            reply = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    reply += block.text
+
+            if not reply:
+                reply = "I processed your request but couldn't generate a response."
 
             # Send the response (split if too long for Discord)
             if len(reply) <= 2000:
@@ -376,5 +642,9 @@ if __name__ == "__main__":
     if not ANTHROPIC_API_KEY:
         print("Warning: ANTHROPIC_API_KEY not found in environment variables")
         print("The bot will start but won't respond to @mentions until configured")
+
+    if not ATTIO_API_KEY:
+        print("Warning: ATTIO_API_KEY not found in environment variables")
+        print("The bot will start but won't have CRM access until configured")
 
     client.run(DISCORD_TOKEN)
