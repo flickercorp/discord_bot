@@ -56,13 +56,22 @@ async def generate_business_quote() -> str:
     if not claude_client:
         return random.choice(FALLBACK_QUOTES)
 
+    topics = [
+        "startup growth", "leadership", "perseverance", "innovation",
+        "teamwork", "taking risks", "focus and discipline", "customer obsession",
+        "learning from failure", "building culture", "ambition", "creativity",
+        "execution over ideas", "resilience", "thinking big",
+    ]
+    topic = random.choice(topics)
+    today = datetime.now().strftime("%A, %B %d")
+
     try:
         response = claude_client.messages.create(
             model="claude-opus-4-6",
             max_tokens=150,
             messages=[{
                 "role": "user",
-                "content": "Generate a single inspiring business or entrepreneurship quote. It can be a real quote from a famous entrepreneur/business leader with attribution, or an original inspiring thought. Keep it concise (1-2 sentences max). Return ONLY the quote, nothing else."
+                "content": f"Today is {today}. Generate a single inspiring quote about {topic} from a famous entrepreneur or business leader (with attribution). Pick someone unexpected — avoid the most overused quotes. Keep it to 1-2 sentences. Return ONLY the quote, nothing else."
             }],
         )
         return response.content[0].text.strip()
